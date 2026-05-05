@@ -199,6 +199,10 @@ TELEGRAM_CHAT_IDS=123456789,987654321,-1001234567890
 
 TradingView Desktop no está corriendo con CDP. Lanzalo con `--remote-debugging-port=9222` o usá el script del tradingview-mcp.
 
+### Las alertas reportan un símbolo que no es el del chart que estoy mirando
+
+Esto se arregló en el commit `18044d2`. El poller ahora refresca el símbolo en cada poll cycle. Cuando cambiás de chart en TradingView (ej. SOLUSDT → BTCUSD), el poller lo detecta en máximo 5s y re-indexa los OBs del nuevo chart como "ya vistos" para no spamearte con OBs viejos. Si tu repo es viejo, hacé `git pull`.
+
 ### Llegan alertas con `Price: NaN`
 
 El mapeo de colores está vacío o mal configurado. Re-corré `node poller/index.js --inspect-colors` y `node poller/analyze.js`.
