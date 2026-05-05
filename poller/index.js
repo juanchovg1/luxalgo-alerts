@@ -115,6 +115,23 @@ async function postAlert(ob) {
 }
 
 async function pollOnce() {
+  // Refresh symbol every cycle so alerts always reflect the chart the user is currently viewing.
+  // If the symbol changed since last poll, reset seenIds and re-warmup (existing OBs on the new
+  // chart are pre-existing, not "new" alerts).
+  let symbolChanged = false;
+  try {
+    const s = await fetchStatus();
+    const newSymbol = s.chart_symbol || 'UNKNOWN';
+    if (newSymbol !== currentSymbol) {
+      log(`symbol changed: ${currentSymbol} → ${newSymbol} — re-warming up`);
+      currentSymbol = newSymbol;
+      seenIds.clear();
+      symbolChanged = true;
+    }
+  } catch (e) {
+    log('status refresh failed:', e.message);
+  }
+
   const boxes = await fetchBoxes();
   const obs = groupBoxesIntoOBs(boxes);
 
@@ -127,15 +144,15 @@ async function pollOnce() {
     }
   }
 
-  if (firstCycle) {
+  if (firstCycle || symbolChanged) {
     firstCycle = false;
     obs.forEach(ob => ob.ids.forEach(id => seenIds.add(id)));
-    log(`warmup: indexed ${obs.length} existing OBs (${obs.filter(o => o.direction === 'BULLISH').length} bull / ${obs.filter(o => o.direction === 'BEARISH').length} bear)`);
-    if (WARMUP_SKIP) return;
+    log(`warmup: indexed ${obs.length} existing OBs on ${currentSymbol} (${obs.filter(o => o.direction === 'BULLISH').length} bull / ${obs.filter(o => o.direction === 'BEARISH').length} bear)`);
+    if (WARMUP_SKIP || symbolChanged) return;
   }
 
   if (newOBs.length > 0) {
-    log(`detected ${newOBs.length} new OB(s)`);
+    log(`detected ${newOBs.length} new OB(s) on ${currentSymbol}`);
     for (const ob of newOBs) {
       log(`  ${ob.direction} OB @ mid=${ob.mid} [${ob.low}-${ob.high}]`);
       await postAlert(ob);
