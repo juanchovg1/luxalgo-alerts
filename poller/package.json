@@ -8,6 +8,7 @@
     "dry-run": "node index.js --dry-run"
   },
   "dependencies": {
+    "chrome-remote-interface": "^0.33.3",
     "dotenv": "^16.4.5"
   }
 }

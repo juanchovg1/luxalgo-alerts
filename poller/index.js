@@ -1,8 +1,7 @@
 import 'dotenv/config';
-import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readAllTabs, closeAll } from './cdp-multi.js';
 
-const TV_CLI = process.env.TV_CLI;
 const ALERT_ENDPOINT = process.env.ALERT_ENDPOINT || 'http://localhost:3000/alert';
 const INTERVAL = Number(process.env.POLL_INTERVAL_MS || 5000);
 const COLOR_BULLISH = Number(process.env.COLOR_BULLISH);
@@ -11,43 +10,12 @@ const WARMUP_SKIP = String(process.env.WARMUP_SKIP || 'true') === 'true';
 const DRY_RUN = process.argv.includes('--dry-run');
 const INSPECT_COLORS = process.argv.includes('--inspect-colors');
 
-if (!TV_CLI) throw new Error('TV_CLI not set in .env');
-
-const seenIds = new Set();
-let firstCycle = true;
-let currentSymbol = 'UNKNOWN';
+// Per-tab state. Each tab gets its own seenIds set, keyed by targetId.
+// This keeps OB tracking isolated when the user has multiple charts open.
+const tabState = new Map(); // targetId → { symbol, seenIds: Set<number>, firstCycle: boolean }
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
-}
-
-function runTvCli(args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('node', [TV_CLI, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    proc.stdout.on('data', d => out += d.toString());
-    proc.stderr.on('data', d => err += d.toString());
-    proc.on('error', reject);
-    proc.on('close', code => {
-      if (code !== 0) return reject(new Error(`tv CLI exited ${code}: ${err}`));
-      try { resolve(JSON.parse(out)); } catch (e) { reject(new Error(`tv CLI bad JSON: ${e.message}\nRAW: ${out.slice(0, 200)}`)); }
-    });
-  });
-}
-
-async function fetchStatus() {
-  const r = await runTvCli(['status']);
-  if (!r.success) throw new Error('tv status failed');
-  return r;
-}
-
-async function fetchBoxes() {
-  const r = await runTvCli(['data', 'boxes', '-v', '-f', 'LuxAlgo']);
-  if (!r.success) throw new Error('tv data boxes failed');
-  const study = r.studies && r.studies[0];
-  if (!study) return [];
-  return study.all_boxes || [];
 }
 
 function classify(box) {
@@ -56,7 +24,7 @@ function classify(box) {
   return null;
 }
 
-// LuxAlgo draws 2 adjacent boxes per OB (sharing a midpoint y).
+// LuxAlgo draws 2 adjacent boxes per OB sharing a midpoint y.
 // Group by (x1, color) so each pair becomes one OB.
 function groupBoxesIntoOBs(boxes) {
   const groups = new Map();
@@ -69,7 +37,8 @@ function groupBoxesIntoOBs(boxes) {
   }
   const obs = [];
   for (const g of groups.values()) {
-    const ys = g.boxes.flatMap(b => [b.high, b.low]);
+    const ys = g.boxes.flatMap(b => [b.y1, b.y2]).filter(v => typeof v === 'number');
+    if (ys.length === 0) continue;
     const high = Math.max(...ys);
     const low = Math.min(...ys);
     const ids = g.boxes.map(b => b.id).sort((a, b) => a - b);
@@ -87,18 +56,10 @@ function groupBoxesIntoOBs(boxes) {
   return obs;
 }
 
-async function postAlert(ob) {
-  const payload = {
-    symbol: currentSymbol,
-    type: 'INTERNAL',
-    direction: ob.direction,
-    price: String(ob.mid),
-    time: Date.now(),
-    extra: { high: ob.high, low: ob.low, x1: ob.x1, ids: ob.ids },
-  };
-  const text = `OB_${ob.direction}_INTERNAL|${ob.mid}|${Date.now()}|${currentSymbol}`;
+async function postAlert(symbol, ob) {
+  const text = `OB_${ob.direction}_INTERNAL|${ob.mid}|${Date.now()}|${symbol}`;
   if (DRY_RUN) {
-    log('[DRY-RUN] would POST:', text);
+    log('[DRY-RUN]', text);
     return;
   }
   try {
@@ -115,60 +76,95 @@ async function postAlert(ob) {
 }
 
 async function pollOnce() {
-  // Refresh symbol every cycle so alerts always reflect the chart the user is currently viewing.
-  // If the symbol changed since last poll, reset seenIds and re-warmup (existing OBs on the new
-  // chart are pre-existing, not "new" alerts).
-  let symbolChanged = false;
+  let tabs;
   try {
-    const s = await fetchStatus();
-    const newSymbol = s.chart_symbol || 'UNKNOWN';
-    if (newSymbol !== currentSymbol) {
-      log(`symbol changed: ${currentSymbol} → ${newSymbol} — re-warming up`);
-      currentSymbol = newSymbol;
-      seenIds.clear();
+    tabs = await readAllTabs();
+  } catch (e) {
+    log('readAllTabs failed:', e.message);
+    return;
+  }
+
+  if (tabs.length === 0) {
+    log('no TradingView tabs found');
+    return;
+  }
+
+  // Drop state for tabs that no longer exist (user closed them)
+  const liveIds = new Set(tabs.map(t => t.targetId));
+  for (const id of [...tabState.keys()]) {
+    if (!liveIds.has(id)) {
+      log(`tab closed: ${tabState.get(id).symbol} (${id.slice(0, 8)})`);
+      tabState.delete(id);
+    }
+  }
+
+  for (const tab of tabs) {
+    if (tab.error) {
+      // First poll of a fresh tab can hit a not-yet-loaded chart widget. Silently retry next cycle.
+      continue;
+    }
+    const symbol = tab.symbol || 'UNKNOWN';
+    const studies = tab.studies || [];
+    const allBoxes = studies.flatMap(s => s.items || []);
+    const obs = groupBoxesIntoOBs(allBoxes);
+
+    let st = tabState.get(tab.targetId);
+    if (!st) {
+      st = { symbol, seenIds: new Set(), firstCycle: true };
+      tabState.set(tab.targetId, st);
+    }
+
+    // If the symbol changed within the same tab (user changed ticker without closing tab),
+    // re-warmup so we don't emit existing OBs as new.
+    let symbolChanged = false;
+    if (st.symbol !== symbol) {
+      log(`symbol changed in tab ${tab.targetId.slice(0, 8)}: ${st.symbol} → ${symbol}`);
+      st.symbol = symbol;
+      st.seenIds.clear();
       symbolChanged = true;
     }
-  } catch (e) {
-    log('status refresh failed:', e.message);
-  }
 
-  const boxes = await fetchBoxes();
-  const obs = groupBoxesIntoOBs(boxes);
-
-  const newOBs = [];
-  for (const ob of obs) {
-    const newIds = ob.ids.filter(id => !seenIds.has(id));
-    if (newIds.length > 0) {
-      newOBs.push(ob);
-      ob.ids.forEach(id => seenIds.add(id));
+    const newOBs = [];
+    for (const ob of obs) {
+      const newIds = ob.ids.filter(id => !st.seenIds.has(id));
+      if (newIds.length > 0) {
+        newOBs.push(ob);
+        ob.ids.forEach(id => st.seenIds.add(id));
+      }
     }
-  }
 
-  if (firstCycle || symbolChanged) {
-    firstCycle = false;
-    obs.forEach(ob => ob.ids.forEach(id => seenIds.add(id)));
-    log(`warmup: indexed ${obs.length} existing OBs on ${currentSymbol} (${obs.filter(o => o.direction === 'BULLISH').length} bull / ${obs.filter(o => o.direction === 'BEARISH').length} bear)`);
-    if (WARMUP_SKIP || symbolChanged) return;
-  }
+    if (st.firstCycle || symbolChanged) {
+      st.firstCycle = false;
+      obs.forEach(ob => ob.ids.forEach(id => st.seenIds.add(id)));
+      const bull = obs.filter(o => o.direction === 'BULLISH').length;
+      const bear = obs.filter(o => o.direction === 'BEARISH').length;
+      log(`warmup: ${symbol} (${tab.targetId.slice(0, 8)}) — indexed ${obs.length} OBs (${bull} bull / ${bear} bear)`);
+      if (WARMUP_SKIP || symbolChanged) continue;
+    }
 
-  if (newOBs.length > 0) {
-    log(`detected ${newOBs.length} new OB(s) on ${currentSymbol}`);
-    for (const ob of newOBs) {
-      log(`  ${ob.direction} OB @ mid=${ob.mid} [${ob.low}-${ob.high}]`);
-      await postAlert(ob);
+    if (newOBs.length > 0) {
+      log(`detected ${newOBs.length} new OB(s) on ${symbol}`);
+      for (const ob of newOBs) {
+        log(`  ${ob.direction} OB @ mid=${ob.mid} [${ob.low}-${ob.high}]`);
+        await postAlert(symbol, ob);
+      }
     }
   }
 }
 
 async function inspectColors() {
-  const boxes = await fetchBoxes();
+  const tabs = await readAllTabs();
   const tally = new Map();
-  for (const b of boxes) {
-    const c = b.bgColor;
-    tally.set(c, (tally.get(c) || 0) + 1);
+  for (const tab of tabs) {
+    if (tab.error) continue;
+    for (const study of tab.studies || []) {
+      for (const b of study.items || []) {
+        tally.set(b.bgColor, (tally.get(b.bgColor) || 0) + 1);
+      }
+    }
   }
   const sorted = [...tally.entries()].sort((a, b) => b[1] - a[1]);
-  log('Color distribution across LuxAlgo boxes:');
+  log(`Color distribution across ${tabs.length} tab(s):`);
   for (const [argb, count] of sorted) {
     const u = argb >>> 0;
     const a = (u >>> 24) & 0xff;
@@ -185,15 +181,21 @@ async function inspectColors() {
 async function main() {
   if (INSPECT_COLORS) {
     await inspectColors();
+    await closeAll();
     return;
   }
-  log(`luxalgo-alerts poller starting (interval=${INTERVAL}ms, dry-run=${DRY_RUN})`);
+  log(`luxalgo-alerts poller starting (interval=${INTERVAL}ms, dry-run=${DRY_RUN}, multi-tab=true)`);
+
+  // Initial connectivity check
   try {
-    const s = await fetchStatus();
-    currentSymbol = s.chart_symbol || 'UNKNOWN';
-    log(`connected to TradingView: ${currentSymbol} @ ${s.chart_resolution}m`);
+    const tabs = await readAllTabs();
+    log(`connected to TradingView: ${tabs.length} tab(s) detected`);
+    for (const t of tabs) {
+      log(`  • ${t.symbol || '?'} @ ${t.resolution || '?'}m  (${t.targetId.slice(0, 8)})`);
+    }
   } catch (e) {
-    log('initial status check failed:', e.message);
+    log('initial CDP check failed:', e.message);
+    log('Is TradingView Desktop running with --remote-debugging-port=9222?');
     process.exit(1);
   }
 
