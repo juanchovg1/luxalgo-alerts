@@ -2,7 +2,9 @@
 
 Pipeline local que escucha Order Blocks del indicador **LuxAlgo Smart Money Concepts** dibujados en TradingView Desktop y los envía como alertas a Telegram en tiempo real.
 
-No modifica el indicador. No usa webhooks ni la cuenta paga de TradingView. No depende de extensiones de Chrome. Lee directamente las cajas (`box.new`) que el indicador dibuja en el chart, vía Chrome DevTools Protocol, usando el proyecto [tradingview-mcp](https://github.com/tradesdontlie/tradingview-mcp).
+No modifica el indicador. No usa webhooks ni la cuenta paga de TradingView. No depende de extensiones de Chrome. Lee directamente las cajas (`box.new`) que el indicador dibuja en el chart, vía Chrome DevTools Protocol.
+
+**Soporta múltiples tabs simultáneos** — si tenés 2 charts abiertos (ej. BTCUSD + XAUUSD), el poller lee ambos en paralelo y te alerta de OBs nuevos en cualquiera de ellos. Sin alternar tabs, sin disrupción.
 
 ```
 TradingView Desktop (LuxAlgo SMC)
@@ -201,7 +203,7 @@ TradingView Desktop no está corriendo con CDP. Lanzalo con `--remote-debugging-
 
 ### Las alertas reportan un símbolo que no es el del chart que estoy mirando
 
-Esto se arregló en el commit `18044d2`. El poller ahora refresca el símbolo en cada poll cycle. Cuando cambiás de chart en TradingView (ej. SOLUSDT → BTCUSD), el poller lo detecta en máximo 5s y re-indexa los OBs del nuevo chart como "ya vistos" para no spamearte con OBs viejos. Si tu repo es viejo, hacé `git pull`.
+Resuelto desde el commit `29ce997` (multi-tab). Cada tab abierto en TradingView se lee como una fuente independiente y los OBs se etiquetan con el símbolo correcto. Si abrís/cerrás tabs, el poller lo detecta automáticamente sin reiniciar nada.
 
 ### Llegan alertas con `Price: NaN`
 
