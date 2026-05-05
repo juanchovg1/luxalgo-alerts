@@ -6,13 +6,18 @@ const ALERT_ENDPOINT = process.env.ALERT_ENDPOINT || 'http://localhost:3000/aler
 const INTERVAL = Number(process.env.POLL_INTERVAL_MS || 5000);
 const COLOR_BULLISH = Number(process.env.COLOR_BULLISH);
 const COLOR_BEARISH = Number(process.env.COLOR_BEARISH);
-const WARMUP_SKIP = String(process.env.WARMUP_SKIP || 'true') === 'true';
+// (WARMUP_SKIP is now obsolete; replaced by WARMUP_MS time window — kept for backward compat)
 const DRY_RUN = process.argv.includes('--dry-run');
 const INSPECT_COLORS = process.argv.includes('--inspect-colors');
 
 // Per-tab state. Each tab gets its own seenIds set, keyed by targetId.
 // This keeps OB tracking isolated when the user has multiple charts open.
-const tabState = new Map(); // targetId → { symbol, seenIds: Set<number>, firstCycle: boolean }
+const tabState = new Map(); // targetId → { symbol, seenIds: Set<number>, warmupUntil: number }
+
+// Time after a tab opens or its symbol changes during which all OBs are silently indexed
+// instead of emitted as alerts. LuxAlgo can take several seconds to recalculate OBs after
+// a chart change, so we use a time window rather than a single cycle.
+const WARMUP_MS = Number(process.env.WARMUP_MS || 15000);
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
@@ -110,36 +115,43 @@ async function pollOnce() {
 
     let st = tabState.get(tab.targetId);
     if (!st) {
-      st = { symbol, seenIds: new Set(), firstCycle: true };
+      // Brand new tab → start warmup window
+      st = {
+        symbol,
+        seenIds: new Set(),
+        warmupUntil: Date.now() + WARMUP_MS,
+      };
       tabState.set(tab.targetId, st);
+      log(`new tab: ${symbol} (${tab.targetId.slice(0, 8)}) — warming up for ${WARMUP_MS / 1000}s`);
     }
 
-    // If the symbol changed within the same tab (user changed ticker without closing tab),
-    // re-warmup so we don't emit existing OBs as new.
-    let symbolChanged = false;
+    // If the symbol changed within the same tab → restart warmup window
     if (st.symbol !== symbol) {
-      log(`symbol changed in tab ${tab.targetId.slice(0, 8)}: ${st.symbol} → ${symbol}`);
+      log(`symbol changed in tab ${tab.targetId.slice(0, 8)}: ${st.symbol} → ${symbol} — re-warming up`);
       st.symbol = symbol;
       st.seenIds.clear();
-      symbolChanged = true;
+      st.warmupUntil = Date.now() + WARMUP_MS;
     }
 
+    const inWarmup = Date.now() < st.warmupUntil;
+
+    // Find OBs that have at least one ID we've never seen on this tab
     const newOBs = [];
     for (const ob of obs) {
-      const newIds = ob.ids.filter(id => !st.seenIds.has(id));
-      if (newIds.length > 0) {
-        newOBs.push(ob);
+      const isNew = ob.ids.some(id => !st.seenIds.has(id));
+      if (isNew) {
+        if (!inWarmup) newOBs.push(ob);
+        // Always index — both during warmup (silent) and after (we just emitted them)
         ob.ids.forEach(id => st.seenIds.add(id));
       }
     }
 
-    if (st.firstCycle || symbolChanged) {
-      st.firstCycle = false;
-      obs.forEach(ob => ob.ids.forEach(id => st.seenIds.add(id)));
+    if (inWarmup) {
       const bull = obs.filter(o => o.direction === 'BULLISH').length;
       const bear = obs.filter(o => o.direction === 'BEARISH').length;
-      log(`warmup: ${symbol} (${tab.targetId.slice(0, 8)}) — indexed ${obs.length} OBs (${bull} bull / ${bear} bear)`);
-      if (WARMUP_SKIP || symbolChanged) continue;
+      const remaining = ((st.warmupUntil - Date.now()) / 1000).toFixed(1);
+      log(`warmup ${symbol}: ${obs.length} OBs indexed (${bull} bull / ${bear} bear), ${remaining}s left`);
+      continue;
     }
 
     if (newOBs.length > 0) {
